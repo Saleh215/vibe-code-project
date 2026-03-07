@@ -1,110 +1,111 @@
 import { NextResponse } from "next/server";
 
-const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1/models";
-const MODEL_CASCADE = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b"];
+// ─── app/api/analyze/route.js ─────────────────────────────────────────────────
+// Groq API (مجاني) + pdf2json لقراءة PDF (يعمل مع Node 20.15)
 
-// ─── FIXED: No angle-bracket placeholders that confuse Gemini ────────────────
-// Using a concrete example instead so the model always returns valid JSON
+const GROQ_BASE = "https://api.groq.com/openai/v1/chat/completions";
+const GROQ_MODELS = [
+  "llama-3.3-70b-versatile",
+  "llama-3.1-8b-instant",
+  "gemma2-9b-it",
+];
+
+// ─── PDF extraction using pdf2json (works with Node 20.15) ────────────────────
+async function extractPdfText(buffer) {
+  const PDFParser = (await import("pdf2json")).default;
+  return new Promise((resolve, reject) => {
+    const parser = new PDFParser(null, 1);
+    parser.on("pdfParser_dataReady", (data) => {
+      try {
+        const text = data.Pages
+          .flatMap(p => p.Texts)
+          .map(t => decodeURIComponent(t.R.map(r => r.T).join("")))
+          .join(" ")
+          .replace(/\s+/g, " ")
+          .trim();
+        resolve(text);
+      } catch (e) {
+        reject(new Error("فشل استخراج النص من PDF"));
+      }
+    });
+    parser.on("pdfParser_dataError", (err) => {
+      reject(new Error(err?.parserError || "فشل قراءة PDF"));
+    });
+    parser.parseBuffer(buffer);
+  });
+}
+
 function buildPrompt(resumeText) {
-  return `You are a Saudi career expert. Analyze the resume and return ONLY a JSON object. No explanation, no markdown, no backticks. Start your response with { and end with }.
+  return `You are a Saudi career expert for Vision 2030. Analyze the resume and return ONLY a JSON object. Start with { and end with }. No explanation, no markdown.
 
 RESUME:
 ${resumeText}
 
-Return this exact JSON structure (fill in real values based on the resume):
-{"label":"مطور برمجيات","riskScore":25,"currentSkills":["JavaScript","React","Node.js","SQL","Git"],"futureSkills":["الذكاء الاصطناعي التوليدي","MLOps","هندسة البيانات","أمن السحابة","تطوير وكلاء الذكاء الاصطناعي"],"courses":[{"title":"أساسيات الذكاء الاصطناعي والتعلم الآلي","provider":"Coursera","duration":"4 أسابيع","level":"مبتدئ"},{"title":"تطبيقات نماذج اللغة الكبيرة","provider":"DeepLearning.AI","duration":"6 أسابيع","level":"متوسط"},{"title":"بناء وكلاء الذكاء الاصطناعي","provider":"Udacity","duration":"8 أسابيع","level":"متقدم"}]}
+Return this exact JSON (fill real values from the resume):
+{"label":"محاسب قانوني","riskScore":75,"currentSkills":["Excel","SAP","التدقيق الورقي","إعداد الميزانيات","تسوية الحسابات"],"futureSkills":["المحاسبة الرقمية بالذكاء الاصطناعي","تحليل البيانات المالية","أتمتة العمليات المحاسبية","الذكاء الاصطناعي في التدقيق","المحاسبة السحابية"],"courses":[{"title":"أساسيات تحليل البيانات المالية","provider":"Coursera","duration":"4 أسابيع","level":"مبتدئ"},{"title":"الذكاء الاصطناعي في المحاسبة","provider":"edX","duration":"6 أسابيع","level":"متوسط"},{"title":"أتمتة العمليات المالية","provider":"Udacity","duration":"8 أسابيع","level":"متقدم"}]}
 
-RULES for your response:
-1. label: Arabic job title from the resume (2-4 words)
-2. riskScore: number between 0 and 100 (no quotes, just the number)
-   - 70 to 90 for routine jobs (data entry, basic accounting, clerical)
-   - 40 to 69 for mixed jobs (HR, marketing, law, logistics)
-   - 10 to 39 for technical or creative jobs (software, AI, healthcare, teaching)
-3. currentSkills: array of 5 strings extracted from the resume
-4. futureSkills: array of 5 Arabic strings for Vision 2030 future skills
-5. courses: array of exactly 3 course objects with title, provider, duration, level all in Arabic
-6. ALL string values must be in Arabic
-7. Return ONLY the JSON object. Start with { and end with }. Nothing else.`;
+STRICT RULES:
+1. label: Arabic job title from resume (2-4 words)
+2. riskScore: number 0-100 only, no quotes
+   - 70-90: routine jobs (data entry, basic accounting, clerical)
+   - 40-69: mixed jobs (HR, marketing, law)
+   - 10-39: technical/creative (software, AI, healthcare, teaching)
+3. currentSkills: exactly 5 Arabic strings from the resume
+4. futureSkills: exactly 5 Arabic strings for Vision 2030
+5. courses: exactly 3 objects, all values in Arabic
+6. Return ONLY the JSON. Nothing before {, nothing after }.`;
 }
 
-// ─── Bullet-proof response parser ────────────────────────────────────────────
-function parseGeminiResponse(raw) {
-  if (!raw || typeof raw !== "string") throw new Error("استجابة فارغة من Gemini");
-
-  // Strip markdown fences
-  let text = raw
-    .replace(/^```json\s*/im, "")
-    .replace(/^```\s*/im, "")
-    .replace(/```\s*$/im, "")
-    .trim();
-
-  // If model prefixed with explanation text, find the first {
-  const braceStart = text.indexOf("{");
-  const braceEnd = text.lastIndexOf("}");
-  if (braceStart === -1 || braceEnd === -1) {
-    throw new Error(`لم يُرجع Gemini JSON صالح. الاستجابة: ${text.slice(0, 120)}`);
-  }
-  text = text.slice(braceStart, braceEnd + 1);
-
-  // Fix common JSON issues from LLMs
-  text = text
-    // Remove trailing commas before } or ]
-    .replace(/,\s*([}\]])/g, "$1")
-    // Fix unquoted numeric values that might have dashes (the original bug)
-    .replace(/"riskScore"\s*:\s*-?\s*(\d+)/g, '"riskScore": $1');
-
+function parseResponse(raw) {
+  if (!raw) throw new Error("استجابة فارغة");
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start === -1 || end === -1) throw new Error("لم يُرجع النموذج JSON صالح");
+  const text = raw.slice(start, end + 1).replace(/,\s*([}\]])/g, "$1");
   try {
     return JSON.parse(text);
   } catch (e) {
-    throw new Error(`JSON parse error: ${e.message}. Text: ${text.slice(0, 200)}`);
+    throw new Error(`خطأ في JSON: ${e.message}`);
   }
 }
 
-async function callGemini(modelName, apiKey, prompt) {
-  const url = `${GEMINI_BASE}/${modelName}:generateContent?key=${apiKey}`;
-  const res = await fetch(url, {
+async function callGroq(model, apiKey, prompt) {
+  const res = await fetch(GROQ_BASE, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${apiKey}`,
+    },
     body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: {
-        temperature: 0.1,       // Lower = more predictable JSON output
-        maxOutputTokens: 2048,
-        topP: 0.8,
-      },
+      model,
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.1,
+      max_tokens: 2048,
     }),
   });
 
   if (!res.ok) {
-    const errBody = await res.json().catch(() => ({}));
-    const e = new Error(errBody?.error?.message || `HTTP ${res.status}`);
+    const err = await res.json().catch(() => ({}));
+    const e = new Error(err?.error?.message || `HTTP ${res.status}`);
     e.status = res.status;
     throw e;
   }
 
   const data = await res.json();
-
-  // Check for safety blocks
-  const candidate = data?.candidates?.[0];
-  if (candidate?.finishReason === "SAFETY") {
-    throw new Error("تم حجب الاستجابة بسبب فلاتر الأمان");
-  }
-
-  const raw = candidate?.content?.parts?.[0]?.text || "";
-  return parseGeminiResponse(raw);
+  const raw = data?.choices?.[0]?.message?.content || "";
+  return parseResponse(raw);
 }
 
 export async function POST(req) {
   try {
-    const apiKey = process.env.GEMINI_API_KEY;
+    const apiKey = process.env.GROQ_API_KEY;
     if (!apiKey) {
       return NextResponse.json(
-        { error: "⚙️ GEMINI_API_KEY غير موجود. أضفه في Vercel → Settings → Environment Variables أو في .env.local" },
+        { error: "GROQ_API_KEY غير موجود — أضفه في .env.local أو Vercel Environment Variables" },
         { status: 500 }
       );
     }
 
-    // ── Parse incoming request: JSON text or FormData (PDF/TXT) ──────────────
     let resumeText = "";
     const ct = req.headers.get("content-type") || "";
 
@@ -118,15 +119,13 @@ export async function POST(req) {
 
       if (name.endsWith(".pdf") || file.type === "application/pdf") {
         try {
-          const pdfParse = (await import("pdf-parse/lib/pdf-parse.js")).default;
-          const result = await pdfParse(buf);
-          resumeText = result.text;
+          resumeText = await extractPdfText(buf);
           if (!resumeText.trim()) throw new Error("empty");
-        } catch (pdfErr) {
-          const msg = pdfErr.message === "empty"
-            ? "ملف PDF فارغ أو محمي بكلمة مرور"
-            : "فشل قراءة PDF — نفّذ: npm install pdf-parse ثم أعد تشغيل السيرفر";
-          return NextResponse.json({ error: msg }, { status: 500 });
+        } catch (e) {
+          return NextResponse.json(
+            { error: e.message === "empty" ? "ملف PDF فارغ أو محمي بكلمة مرور" : `فشل قراءة PDF: ${e.message}` },
+            { status: 500 }
+          );
         }
       } else {
         resumeText = buf.toString("utf-8");
@@ -140,51 +139,32 @@ export async function POST(req) {
       return NextResponse.json({ error: "نص السيرة الذاتية فارغ" }, { status: 400 });
     }
 
-    // ── Try each model, fall through on quota/404 errors ─────────────────────
     const prompt = buildPrompt(resumeText);
     let lastError = null;
 
-    for (const model of MODEL_CASCADE) {
+    for (const model of GROQ_MODELS) {
       try {
-        console.log(`[analyze] Trying ${model}...`);
-        const parsed = await callGemini(model, apiKey, prompt);
+        console.log(`[analyze] Trying Groq/${model}...`);
+        const parsed = await callGroq(model, apiKey, prompt);
 
         if (!parsed.label || parsed.riskScore === undefined) {
-          throw new Error("بيانات غير مكتملة في الاستجابة");
+          throw new Error("بيانات غير مكتملة");
         }
 
-        // Ensure riskScore is a number
-        parsed.riskScore = Number(parsed.riskScore) || 0;
-
-        console.log(`[analyze] ✅ ${model} succeeded`);
+        parsed.riskScore = Math.min(100, Math.max(0, Number(parsed.riskScore) || 0));
+        console.log(`[analyze] ✅ Success: ${model}`);
         return NextResponse.json({ ...parsed, _model: model });
 
       } catch (err) {
-        const msg = err.message || "";
-        const isRetryable =
-          err.status === 429 || err.status === 404 ||
-          msg.includes("quota") || msg.includes("not found") ||
-          msg.includes("404") || msg.includes("429");
-
-        if (isRetryable) {
-          console.warn(`[analyze] ⚠️  ${model}: ${msg.slice(0, 80)} — trying next`);
-          lastError = err;
-          continue;
-        }
-
-        // Hard error — return immediately with full message
-        console.error(`[analyze] ❌ ${model}: ${msg}`);
-        return NextResponse.json({ error: msg }, { status: 500 });
+        const isRetryable = err.status === 429 || err.status === 503 ||
+          (err.message || "").includes("rate") || (err.message || "").includes("limit");
+        if (isRetryable) { lastError = err; continue; }
+        return NextResponse.json({ error: err.message }, { status: 500 });
       }
     }
 
-    // All models exhausted
-    console.error("[analyze] All models failed:", lastError?.message);
     return NextResponse.json(
-      {
-        error: "تم استنفاد حصة جميع النماذج. أنشئ مفتاح API جديد على https://aistudio.google.com/apikey",
-        quotaExhausted: true,
-      },
+      { error: "تم تجاوز حصة Groq المجانية مؤقتاً. حاول بعد دقيقة.", quotaExhausted: true },
       { status: 429 }
     );
 

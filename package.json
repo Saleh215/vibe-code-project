@@ -12,6 +12,7 @@
     "clsx": "latest",
     "lucide-react": "latest",
     "next": "latest",
+    "pdf2json": "^4.0.2",
     "react": "latest",
     "react-dom": "latest",
     "tailwind-merge": "latest"

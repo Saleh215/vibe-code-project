@@ -1,63 +1,95 @@
 import { NextResponse } from "next/server";
 
-const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1/models";
-const MODEL_CASCADE = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b"];
+// ─── app/api/chat/route.js ────────────────────────────────────────────────────
+// يستخدم Groq API للمدرب الذكي — مجاني وسريع جداً
 
-async function callGemini(modelName, apiKey, prompt) {
-  const res = await fetch(`${GEMINI_BASE}/${modelName}:generateContent?key=${apiKey}`, {
+const GROQ_BASE = "https://api.groq.com/openai/v1/chat/completions";
+const GROQ_MODELS = [
+  "llama-3.3-70b-versatile",
+  "llama-3.1-8b-instant",
+  "gemma2-9b-it",
+];
+
+async function callGroq(model, apiKey, messages) {
+  const res = await fetch(GROQ_BASE, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${apiKey}`,
+    },
     body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { temperature: 0.7, maxOutputTokens: 1024 },
+      model,
+      messages,
+      temperature: 0.7,
+      max_tokens: 1024,
     }),
   });
+
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     const e = new Error(err?.error?.message || `HTTP ${res.status}`);
     e.status = res.status;
     throw e;
   }
+
   const data = await res.json();
-  return data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+  return data?.choices?.[0]?.message?.content || "";
 }
 
 export async function POST(req) {
   try {
-    const apiKey = process.env.GEMINI_API_KEY;
+    const apiKey = process.env.GROQ_API_KEY;
     if (!apiKey) {
-      return NextResponse.json({ error: "GEMINI_API_KEY غير موجود" }, { status: 500 });
+      return NextResponse.json(
+        { error: "GROQ_API_KEY غير موجود في متغيرات البيئة" },
+        { status: 500 }
+      );
     }
 
     const { userMessage, roleData, history } = await req.json().catch(() => ({}));
-    if (!userMessage?.trim()) return NextResponse.json({ error: "الرسالة فارغة" }, { status: 400 });
+    if (!userMessage?.trim()) {
+      return NextResponse.json({ error: "الرسالة فارغة" }, { status: 400 });
+    }
 
-    const ctx = `أنت مدرب مهني خبير في "${roleData?.label || "مجال عام"}" ورؤية السعودية 2030.
-درجة خطر الذكاء الاصطناعي: ${roleData?.riskScore || 0}%.
+    // ── Build messages array (OpenAI format that Groq uses) ───────────────────
+    const systemPrompt = `أنت مدرب مهني خبير في "${roleData?.label || "مجال عام"}" ورؤية السعودية 2030.
+درجة خطر الذكاء الاصطناعي على هذه المهنة: ${roleData?.riskScore || 0}%.
 المهارات الحالية: ${(roleData?.currentSkills || []).join("، ")}.
-مهارات المستقبل: ${(roleData?.futureSkills || []).join("، ")}.
-أجب دائماً بالعربية. كن مشجعاً وعملياً. استخدم نقاطاً ورموزاً تعبيرية.`;
+مهارات المستقبل المطلوبة: ${(roleData?.futureSkills || []).join("، ")}.
+أجب دائماً بالعربية. كن مشجعاً وعملياً ومختصراً. استخدم نقاطاً ورموزاً تعبيرية.`;
 
-    const hist = (history || [])
-      .map(m => `${m.role === "user" ? "المستخدم" : "المدرب"}: ${m.content}`)
-      .join("\n");
-
-    const fullPrompt = `${ctx}\n\n${hist}\nالمستخدم: ${userMessage}\nالمدرب:`;
+    const messages = [
+      { role: "system", content: systemPrompt },
+      // Add conversation history
+      ...(history || []).slice(-6).map(m => ({
+        role: m.role === "user" ? "user" : "assistant",
+        content: m.content,
+      })),
+      { role: "user", content: userMessage },
+    ];
 
     let lastError = null;
-    for (const model of MODEL_CASCADE) {
+    for (const model of GROQ_MODELS) {
       try {
-        const text = await callGemini(model, apiKey, fullPrompt);
-        return NextResponse.json({ reply: text, _model: model });
+        console.log(`[chat] Trying Groq/${model}...`);
+        const reply = await callGroq(model, apiKey, messages);
+        console.log(`[chat] ✅ Success: ${model}`);
+        return NextResponse.json({ reply, _model: model });
       } catch (err) {
-        const retryable = err.status === 429 || err.status === 404 || (err.message || "").includes("quota");
-        if (retryable) { lastError = err; continue; }
+        const isRetryable = err.status === 429 || err.status === 503 ||
+          (err.message || "").includes("rate") || (err.message || "").includes("limit");
+        if (isRetryable) { lastError = err; continue; }
         return NextResponse.json({ error: err.message }, { status: 500 });
       }
     }
 
-    return NextResponse.json({ error: "تعذر الوصول لجميع النماذج. حاول مرة أخرى لاحقاً." }, { status: 429 });
+    return NextResponse.json(
+      { error: "تم تجاوز حصة Groq مؤقتاً. حاول بعد دقيقة." },
+      { status: 429 }
+    );
+
   } catch (err) {
+    console.error("[chat] Unexpected:", err?.message);
     return NextResponse.json({ error: err?.message || "خطأ غير متوقع" }, { status: 500 });
   }
 }
